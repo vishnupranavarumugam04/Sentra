@@ -79,7 +79,7 @@ export default function Login({ onLoginSuccess, onBackToForm }) {
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 className="block w-full pl-10 pr-3 py-3 border border-slate-700 rounded-xl bg-slate-900/50 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 sm:text-sm"
-                placeholder="Enter admin password (default: admin123)"
+                placeholder="Enter password"
               />
             </div>
           </div>
