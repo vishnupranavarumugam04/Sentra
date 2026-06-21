@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: sentra-db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: sentra
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: always
+    networks:
+      - sentra-network
+
+  backend:
+    build: ./backend
+    container_name: sentra-backend
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - DB_NAME=sentra
+      - JWT_SECRET=sentra-super-secret-key-1234
+      - ADMIN_PASSWORD=admin123
+      - LIBRETRANSLATE_URL=
+    depends_on:
+      - db
+    volumes:
+      - ./backend/uploads:/app/uploads
+    restart: always
+    networks:
+      - sentra-network
+
+  frontend:
+    build: ./frontend
+    container_name: sentra-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=5000
+    depends_on:
+      - backend
+    restart: always
+    networks:
+      - sentra-network
+
+volumes:
+  pgdata:
+
+networks:
+  sentra-network:
+    driver: bridge
