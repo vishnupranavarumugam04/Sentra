@@ -325,6 +325,50 @@ export default function Dashboard({ onLogout, onBackToUser }) {
     onLogout();
   };
 
+  const handleDeleteReport = async (reportId) => {
+    try {
+      const token = localStorage.getItem('sentra_admin_token');
+      const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+      const response = await fetch(`/api/reports/${reportId}`, {
+        method: 'DELETE',
+        headers
+      });
+
+      if (response.ok) {
+        triggerToast('Report resolved and removed successfully.');
+        setSelectedReport(null);
+        fetchReports(false);
+      } else {
+        const data = await response.json();
+        triggerToast(`Failed to remove: ${data.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error('Error deleting report:', err);
+      triggerToast('Network error while attempting to remove report.');
+    }
+  };
+
+  const handleDeleteAlert = async (alertId) => {
+    try {
+      const token = localStorage.getItem('sentra_admin_token');
+      const headers = token ? { 'Authorization': `Bearer ${token}` } : {};
+      const response = await fetch(`/api/emergency-alerts/${alertId}`, {
+        method: 'DELETE',
+        headers
+      });
+      if (response.ok) {
+        triggerToast('Emergency alert removed.');
+        fetchEmergencyAlerts();
+      } else {
+        const data = await response.json();
+        triggerToast(`Failed to remove: ${data.error || 'Unknown error'}`);
+      }
+    } catch (err) {
+      console.error('Error deleting alert:', err);
+      triggerToast('Network error while removing alert.');
+    }
+  };
+
   return (
     <div className="flex-1 flex flex-col md:flex-row h-screen bg-slate-950 text-slate-100 overflow-hidden">
       
@@ -494,8 +538,15 @@ export default function Dashboard({ onLogout, onBackToUser }) {
                   </div>
                   <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
                     {emergencyAlerts.slice(0, 5).map((alert) => (
-                      <div key={alert.id} className={`rounded-lg p-3 border ${alert.acknowledged ? 'bg-slate-950/40 border-slate-800' : 'bg-red-600/15 border-red-500/30'}`}>
-                        <div className="flex items-center justify-between gap-2">
+                      <div key={alert.id} className={`relative rounded-lg p-3 border ${alert.acknowledged ? 'bg-slate-950/40 border-slate-800' : 'bg-red-600/15 border-red-500/30'}`}>
+                        <button 
+                          onClick={() => handleDeleteAlert(alert.id)}
+                          className="absolute top-2 right-2 p-1 text-slate-400 hover:text-red-400 transition-colors"
+                          title="Remove Alert"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                        <div className="flex items-center justify-between gap-2 pr-6">
                           <span className="text-xs font-bold text-white">{alert.alert_type || 'SOS'}</span>
                           <span className={`text-[10px] font-bold uppercase ${alert.acknowledged ? 'text-slate-400' : 'text-red-300'}`}>{alert.acknowledged ? 'ACKNOWLEDGED' : 'NEW'}</span>
                         </div>
@@ -753,6 +804,23 @@ export default function Dashboard({ onLogout, onBackToUser }) {
                   </span>
                 )}
               </p>
+            </div>
+
+            {/* Action Buttons */}
+            <div className="grid grid-cols-2 gap-3 pt-2">
+              <button 
+                onClick={() => setSelectedReport(null)}
+                className="w-full h-12 rounded-xl bg-slate-900 border border-slate-800 text-white font-bold hover:bg-slate-800 transition-colors"
+              >
+                Close
+              </button>
+              <button 
+                onClick={() => handleDeleteReport(selectedReport.id)}
+                className="w-full h-12 rounded-xl bg-emerald-600/20 text-emerald-400 font-bold border border-emerald-500/30 hover:bg-emerald-600/30 transition-colors flex items-center justify-center space-x-2"
+              >
+                <CheckCircle2 className="h-5 w-5" />
+                <span>Resolve & Remove</span>
+              </button>
             </div>
           </div>
         </div>

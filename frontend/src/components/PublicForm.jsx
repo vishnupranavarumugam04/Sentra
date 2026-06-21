@@ -126,6 +126,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
   const galleryInputRef = useRef(null);
   const cameraVideoRef = useRef(null);
   const cameraStreamRef = useRef(null);
+  const globalCameraInputRef = useRef(null);
   const [mode, setMode] = useState('map'); // 'map' | 'camera' | 'form' | 'history'
 
   // Sync state & update online status
@@ -1256,7 +1257,6 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           <div className="relative h-[70vh]">
             <MapContainer center={[CHENNAI_LAT, CHENNAI_LNG]} zoom={12} scrollWheelZoom style={{ height: '100%', width: '100%' }}>
               <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
-              <MapEventsHandler onMapClick={(lat, lng) => { setLocation({ lat, lng }); setMode('form'); }} />
               {userReports
                 .filter((report) => report.latitude && report.longitude)
                 .map((report) => (
@@ -1488,7 +1488,13 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       {/* Bottom Navigation (user style) */}
       <nav className="fixed bottom-0 left-0 right-0 bg-slate-900/95 border-t border-slate-800 py-3 z-40">
         <div className="max-w-3xl mx-auto px-6 flex items-center justify-between">
-          <button onClick={() => setMode('camera')} className={`flex-1 flex flex-col items-center ${mode==='camera' ? 'text-blue-400' : 'text-slate-300'}`}>
+          <button onClick={() => {
+            if (!navigator.mediaDevices?.getUserMedia) {
+              globalCameraInputRef.current?.click();
+            } else {
+              setMode('camera');
+            }
+          }} className={`flex-1 flex flex-col items-center ${mode==='camera' ? 'text-blue-400' : 'text-slate-300'}`}>
             <Camera className="h-6 w-6" />
           </button>
           <button onClick={() => setMode('map')} className="-mt-6 bg-blue-600 h-14 w-14 rounded-full flex items-center justify-center text-white shadow-lg">
@@ -1499,6 +1505,15 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           </button>
         </div>
       </nav>
+      {/* Global Fallback Camera Input for HTTP connections */}
+      <input 
+        type="file" 
+        accept="image/*" 
+        capture="environment"
+        ref={globalCameraInputRef} 
+        onChange={handlePhotoSelect} 
+        className="hidden"
+      />
     </div>
   );
 }
