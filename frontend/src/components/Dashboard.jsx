@@ -247,12 +247,24 @@ export default function Dashboard({ onLogout, onBackToUser }) {
   useEffect(() => {
     fetchReports(true);
     fetchEmergencyAlerts();
+    
     // Refresh stats and reports every 10 seconds
     const interval = setInterval(() => {
       fetchReports(false);
       fetchEmergencyAlerts();
     }, 10000);
-    return () => clearInterval(interval);
+
+    // Also fetch immediately when user clicks/focuses back on the tab
+    const handleFocus = () => {
+      fetchReports(false);
+      fetchEmergencyAlerts();
+    };
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+    };
   }, []);
 
   // Filter and process statistics
