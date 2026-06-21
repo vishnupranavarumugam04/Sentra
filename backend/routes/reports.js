@@ -104,6 +104,7 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
       latitude,
       longitude,
       landmark_description,
+      location_method,
       language
     } = req.body;
 
@@ -210,12 +211,12 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
       INSERT INTO reports (
         photo_url, damage_level, infrastructure_type, infrastructure_details,
         crisis_type, has_debris, description, description_translated,
-        latitude, longitude, geom, landmark_description, location_group_id,
+        latitude, longitude, geom, landmark_description, location_method, location_group_id,
         is_latest, possible_duplicate, language
       ) VALUES (
         $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
         ST_SetSRID(ST_MakePoint($10, $9), 4326),
-        $11, $12, $13, $14, $15
+        $11, $12, $13, $14, $15, $16
       ) RETURNING *
     `;
     const saveRes = await db.query(insertQuery, [
@@ -230,6 +231,7 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
       latVal,
       lngVal,
       landmark_description || '',
+      location_method || 'manual_pin',
       locationGroupId,
       isLatest,
       possibleDuplicate,
@@ -311,6 +313,7 @@ router.get('/', async (req, res) => {
           latitude: row.latitude,
           longitude: row.longitude,
           landmark_description: row.landmark_description,
+          location_method: row.location_method,
           location_group_id: row.location_group_id,
           is_latest: row.is_latest,
           possible_duplicate: row.possible_duplicate,
@@ -349,6 +352,7 @@ router.get('/export/csv', async (req, res) => {
         { id: 'latitude', title: 'Latitude' },
         { id: 'longitude', title: 'Longitude' },
         { id: 'landmark_description', title: 'Landmark Description' },
+        { id: 'location_method', title: 'Location Method' },
         { id: 'location_group_id', title: 'Location Group ID' },
         { id: 'is_latest', title: 'Is Latest' },
         { id: 'possible_duplicate', title: 'Possible Duplicate' },
@@ -406,6 +410,7 @@ router.get('/export/geojson', async (req, res) => {
           latitude: row.latitude,
           longitude: row.longitude,
           landmark_description: row.landmark_description,
+          location_method: row.location_method,
           location_group_id: row.location_group_id,
           is_latest: row.is_latest,
           possible_duplicate: row.possible_duplicate,

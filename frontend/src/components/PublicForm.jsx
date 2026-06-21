@@ -1,12 +1,13 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MapContainer, TileLayer, Marker, useMapEvents, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, GeoJSON, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { 
   Camera, MapPin, Globe, Check, AlertTriangle, CloudOff, 
   Sparkles, CheckCircle2, ChevronRight, RefreshCw, LogIn, ChevronLeft
 } from 'lucide-react';
-import { saveReportOffline, getOfflineCount } from '../utils/indexedDb';
+import osmtogeojson from 'osmtogeojson';
+import { saveReportOffline, getOfflineCount, saveFootprints, getFootprints } from '../utils/indexedDb';
 
 // Leaflet default icon fix
 delete L.Icon.Default.prototype._getIconUrl;
@@ -35,6 +36,116 @@ function RecenterMap({ position }) {
     }
   }, [position, map]);
   return null;
+}
+
+// Footprint Overlay Component
+function FootprintLayer({ onBuildingClick }) {
+  const map = useMap();
+  const [footprints, setFootprints] = useState(null);
+  const fetchingRef = useRef(false);
+
+  useEffect(() => {
+    const fetchFootprints = async () => {
+      if (fetchingRef.current) return;
+      const bounds = map.getBounds();
+      // bbox format for Overpass: (south, west, north, east)
+      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+      
+      // Simple cache key: round coordinates to reduce granularity 
+      const cacheKey = `bbox_${bounds.getSouth().toFixed(3)}_${bounds.getWest().toFixed(3)}_${bounds.getNorth().toFixed(3)}_${bounds.getEast().toFixed(3)}`;
+      
+      try {
+        fetchingRef.current = true;
+        const cached = await getFootprints(cacheKey);
+        if (cached) {
+          setFootprints(cached);
+          fetchingRef.current = false;
+          return;
+        }
+
+        // Only fetch if zoom is high enough to avoid massive downloads
+        if (map.getZoom() < 16) {
+          setFootprints(null);
+          fetchingRef.current = false;
+          return;
+        }
+
+        const query = `
+          [out:json][timeout:15];
+          (
+            way["building"](${bbox});
+            relation["building"](${bbox});
+          );
+          out body;
+          >;
+          out skel qt;
+        `;
+        
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query
+        });
+        
+        if (!res.ok) throw new Error('Overpass API failed');
+        const data = await res.json();
+        
+        const geojson = osmtogeojson(data);
+        setFootprints(geojson);
+        await saveFootprints(cacheKey, geojson);
+        
+      } catch (err) {
+        console.warn('Failed to fetch footprints:', err);
+      } finally {
+        fetchingRef.current = false;
+      }
+    };
+
+    // Debounce triggers
+    let timer;
+    const triggerFetch = () => {
+      clearTimeout(timer);
+      timer = setTimeout(fetchFootprints, 1000);
+    };
+
+    map.on('moveend', triggerFetch);
+    map.on('zoomend', triggerFetch);
+    
+    // Initial fetch
+    triggerFetch();
+
+    return () => {
+      map.off('moveend', triggerFetch);
+      map.off('zoomend', triggerFetch);
+      clearTimeout(timer);
+    };
+  }, [map]);
+
+  if (!footprints) return null;
+
+  return (
+    <GeoJSON 
+      data={footprints}
+      style={{
+        color: '#3b82f6',
+        weight: 2,
+        opacity: 0.8,
+        fillColor: '#3b82f6',
+        fillOpacity: 0.2
+      }}
+      onEachFeature={(feature, layer) => {
+        layer.on('click', (e) => {
+          L.DomEvent.stopPropagation(e); // Prevent map click from overriding
+          let latlng;
+          if (layer.getBounds) {
+            latlng = layer.getBounds().getCenter();
+          } else {
+            latlng = e.latlng;
+          }
+          onBuildingClick(latlng.lat, latlng.lng);
+        });
+      }}
+    />
+  );
 }
 
 const LANGUAGES = [
@@ -106,6 +217,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
   const [hasDebris, setHasDebris] = useState(false);
   const [description, setDescription] = useState('');
   const [location, setLocation] = useState(null); // { lat, lng }
+  const [locationMethod, setLocationMethod] = useState('manual_pin');
   const [landmarkDesc, setLandmarkDesc] = useState('');
   
   // UI & Network State
@@ -398,6 +510,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       (position) => {
         const { latitude, longitude } = position.coords;
         setLocation({ lat: latitude, lng: longitude });
+        setLocationMethod('manual_pin');
         setGpsSuccessMsg(t('gps_success'));
         setGpsLoading(false);
       },
@@ -456,6 +569,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       latitude: submitLat,
       longitude: submitLng,
       landmark_description: landmarkDesc,
+      location_method: locationMethod,
       language: i18n.language || 'en'
     };
 
@@ -471,6 +585,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       latitude: submitLat,
       longitude: submitLng,
       landmark_description: landmarkDesc,
+      location_method: locationMethod,
       submitted_at: new Date().toISOString(),
       syncStatus: isOnline ? 'SYNCED' : 'PENDING SYNC'
     };
@@ -535,6 +650,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           latitude: payload.latitude,
           longitude: payload.longitude,
           landmark_description: payload.landmark_description,
+          location_method: payload.location_method,
           submitted_at: new Date().toISOString(),
           syncStatus: 'PENDING SYNC'
         },
@@ -885,8 +1001,17 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          <MapEventsHandler onMapClick={(lat, lng) => setLocation({ lat, lng })} />
-          {location && <RecenterMap position={[location.lat, location.lng]} />}
+          <FootprintLayer 
+            onBuildingClick={(lat, lng) => {
+              setLocation({ lat, lng });
+              setLocationMethod('footprint');
+            }}
+          />
+          <MapEventsHandler onMapClick={(lat, lng) => {
+            setLocation({ lat, lng });
+            setLocationMethod('manual_pin');
+          }} />
+          <RecenterMap position={location} />
           {location && (
             <Marker position={[location.lat, location.lng]} />
           )}

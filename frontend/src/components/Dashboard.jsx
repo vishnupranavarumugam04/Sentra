@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, GeoJSON, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 window.L = L;
@@ -8,6 +8,9 @@ import {
   Filter, Download, LayoutDashboard, ChevronLeft, MapPin, 
   Layers, AlertOctagon, Trash2, Calendar, Eye, EyeOff, LogOut, CheckCircle2
 } from 'lucide-react';
+import osmtogeojson from 'osmtogeojson';
+import { getFootprints, saveFootprints } from '../utils/indexedDb';
+import { useRef } from 'react';
 
 // Marker clustering handler helper component
 const createPinIcon = (damageLevel, possibleDuplicate, isLatest) => {
@@ -167,6 +170,97 @@ function MarkerCluster({ reports, selectedReport, setSelectedReport }) {
   }, [selectedReport, map]);
 
   return null;
+}
+
+// Footprint Overlay Component
+function FootprintLayer() {
+  const map = useMap();
+  const [footprints, setFootprints] = useState(null);
+  const fetchingRef = useRef(false);
+
+  useEffect(() => {
+    const fetchFootprints = async () => {
+      if (fetchingRef.current) return;
+      const bounds = map.getBounds();
+      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+      const cacheKey = `bbox_${bounds.getSouth().toFixed(3)}_${bounds.getWest().toFixed(3)}_${bounds.getNorth().toFixed(3)}_${bounds.getEast().toFixed(3)}`;
+      
+      try {
+        fetchingRef.current = true;
+        const cached = await getFootprints(cacheKey);
+        if (cached) {
+          setFootprints(cached);
+          fetchingRef.current = false;
+          return;
+        }
+
+        if (map.getZoom() < 16) {
+          setFootprints(null);
+          fetchingRef.current = false;
+          return;
+        }
+
+        const query = `
+          [out:json][timeout:15];
+          (
+            way["building"](${bbox});
+            relation["building"](${bbox});
+          );
+          out body;
+          >;
+          out skel qt;
+        `;
+        
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query
+        });
+        
+        if (!res.ok) throw new Error('Overpass API failed');
+        const data = await res.json();
+        
+        const geojson = osmtogeojson(data);
+        setFootprints(geojson);
+        await saveFootprints(cacheKey, geojson);
+        
+      } catch (err) {
+        console.warn('Failed to fetch footprints:', err);
+      } finally {
+        fetchingRef.current = false;
+      }
+    };
+
+    let timer;
+    const triggerFetch = () => {
+      clearTimeout(timer);
+      timer = setTimeout(fetchFootprints, 1000);
+    };
+
+    map.on('moveend', triggerFetch);
+    map.on('zoomend', triggerFetch);
+    triggerFetch();
+
+    return () => {
+      map.off('moveend', triggerFetch);
+      map.off('zoomend', triggerFetch);
+      clearTimeout(timer);
+    };
+  }, [map]);
+
+  if (!footprints) return null;
+
+  return (
+    <GeoJSON 
+      data={footprints}
+      style={{
+        color: '#64748b', // Slate 500 for admin dashboard
+        weight: 1,
+        opacity: 0.5,
+        fillColor: '#334155', // Slate 700
+        fillOpacity: 0.3
+      }}
+    />
+  );
 }
 
 export default function Dashboard({ onLogout, onBackToUser }) {
@@ -695,6 +789,7 @@ export default function Dashboard({ onLogout, onBackToUser }) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
+          <FootprintLayer />
           
           {/* Custom Marker clustering logic */}
           <MarkerCluster
