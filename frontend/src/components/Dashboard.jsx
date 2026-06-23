@@ -1,16 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { MapContainer, TileLayer, GeoJSON, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, useMap } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
 window.L = L;
 import 'leaflet.markercluster';
+import 'leaflet.heat';
 import { 
   Filter, Download, LayoutDashboard, ChevronLeft, MapPin, 
   Layers, AlertOctagon, Trash2, Calendar, Eye, EyeOff, LogOut, CheckCircle2
 } from 'lucide-react';
-import osmtogeojson from 'osmtogeojson';
-import { getFootprints, saveFootprints } from '../utils/indexedDb';
-import { useRef } from 'react';
 
 // Marker clustering handler helper component
 const createPinIcon = (damageLevel, possibleDuplicate, isLatest) => {
@@ -42,6 +40,63 @@ const createPinIcon = (damageLevel, possibleDuplicate, isLatest) => {
     popupAnchor: [0, -36]
   });
 };
+
+// Grey question-mark icon for landmark-only reports (no GPS / map-pin coords)
+const createLandmarkIcon = () => {
+  const svgHtml = `
+    <svg width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg"
+         style="filter: drop-shadow(0px 2px 4px rgba(0,0,0,0.5));">
+      <circle cx="16" cy="16" r="15" fill="#475569" stroke="#94a3b8" stroke-width="2"/>
+      <text x="16" y="22" text-anchor="middle" font-size="18" font-weight="bold"
+            font-family="Arial,sans-serif" fill="#f1f5f9">?</text>
+    </svg>
+  `;
+  return window.L.divIcon({
+    html: svgHtml,
+    className: 'custom-landmark-icon',
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+    popupAnchor: [0, -18]
+  });
+};
+
+function HeatmapLayer({ reports }) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (!map || !window.L || !window.L.heatLayer) return;
+
+    const heatData = reports
+      .filter(r => r.latitude !== null && r.longitude !== null && !isNaN(parseFloat(r.latitude)) && !isNaN(parseFloat(r.longitude)))
+      .map(row => {
+        let intensity = 1;
+        if (row.damage_level === 'Completely damaged') intensity += 5;
+        else if (row.damage_level === 'Partially damaged') intensity += 2;
+
+        if (row.infrastructure_type) {
+          const infraStr = row.infrastructure_type.join(',');
+          if (infraStr.includes('Utility')) intensity += 3;
+          if (infraStr.includes('Transport & Communication')) intensity += 2;
+          if (infraStr.includes('Government')) intensity += 2;
+        }
+
+        return [parseFloat(row.latitude), parseFloat(row.longitude), intensity * 10]; // scale intensity for visibility
+      });
+
+    const heatLayer = window.L.heatLayer(heatData, {
+      radius: 25,
+      blur: 15,
+      maxZoom: 14,
+      gradient: { 0.4: 'blue', 0.6: 'cyan', 0.7: 'lime', 0.8: 'yellow', 1.0: 'red' }
+    }).addTo(map);
+
+    return () => {
+      map.removeLayer(heatLayer);
+    };
+  }, [map, reports]);
+
+  return null;
+}
 
 function MarkerCluster({ reports, selectedReport, setSelectedReport }) {
   const map = useMap();
@@ -99,9 +154,44 @@ function MarkerCluster({ reports, selectedReport, setSelectedReport }) {
     reports.forEach((report, index) => {
       const lat = parseFloat(report.latitude);
       const lng = parseFloat(report.longitude);
+      const hasCoords = !isNaN(lat) && !isNaN(lng) && report.latitude !== null && report.longitude !== null;
+      const isLandmarkOnly = !hasCoords && report.landmark_description;
 
-      if (isNaN(lat) || isNaN(lng) || report.latitude === null || report.longitude === null) {
-        console.warn(`[Dashboard Map] Invalid coordinates found at report index ${index}:`, report);
+      // Skip entirely if neither coords nor landmark description
+      if (!hasCoords && !isLandmarkOnly) {
+        console.warn(`[Dashboard Map] Report ${index} has no coordinates or landmark — skipping.`, report);
+        return;
+      }
+
+      if (!hasCoords && isLandmarkOnly) {
+        // ── LANDMARK-ONLY REPORT: grey ? marker at map centre ──
+        const { damage_level } = report;
+        const marker = window.L.marker([DASHBOARD_CENTER_LAT, DASHBOARD_CENTER_LNG], {
+          icon: createLandmarkIcon(),
+          damageLevel: damage_level
+        });
+
+        const popupHtml = `
+          <div class="p-1 font-sans max-w-[210px] text-slate-100">
+            <div class="h-10 bg-slate-950 rounded-lg flex items-center justify-center mb-2 border border-slate-800 text-[9px] text-slate-400">
+              📍 Landmark Only — No GPS Fix
+            </div>
+            <div class="text-[11px] font-bold text-yellow-300 mb-1">
+              ${report.landmark_description || 'No description'}
+            </div>
+            <div class="text-[10px] leading-normal text-slate-300 line-clamp-2 mb-2">
+              ${report.description_translated || report.description || 'No description.'}
+            </div>
+            <button onclick="window.selectReportFromPopup('${report.id}')"
+                    class="w-full text-center py-1 bg-slate-600 hover:bg-slate-500 text-[10px] font-bold text-white rounded transition-colors block border-none cursor-pointer">
+              View Details
+            </button>
+          </div>
+        `;
+
+        marker.bindPopup(popupHtml);
+        marker.on('click', () => setSelectedReport(report));
+        mcg.addLayer(marker);
         return;
       }
 
@@ -124,13 +214,22 @@ function MarkerCluster({ reports, selectedReport, setSelectedReport }) {
            </div>`
         : `<div class="h-10 bg-slate-950 rounded-lg flex items-center justify-center mb-2 border border-slate-800 text-[9px] text-slate-500">No Photo</div>`;
 
+      const sourceTag = report.source === 'whatsapp' 
+        ? `<span class="px-1 py-0.5 rounded text-[8px] font-bold tracking-wider bg-green-500/20 text-green-400 border border-green-500/30 flex items-center gap-1" title="Submitted via WhatsApp">
+             WA
+           </span>`
+        : '';
+
       const popupHtml = `
         <div class="p-1 font-sans max-w-[210px] text-slate-100">
           ${photoTag}
           <div class="flex items-center justify-between mb-1.5 gap-2">
-            <span class="px-1.5 py-0.5 rounded text-[8px] font-bold uppercase tracking-wider ${badgeBg}">
-              ${damage_level.split('/')[0]}
-            </span>
+            <div class="flex items-center gap-1">
+              <span class="px-1.5 py-0.5 rounded text-[8px] font-bold uppercase tracking-wider ${badgeBg}">
+                ${damage_level.split('/')[0]}
+              </span>
+              ${sourceTag}
+            </div>
             <span class="text-[9px] text-slate-400 font-mono">
               ${new Date(report.submitted_at).toLocaleDateString(undefined, {month:'short', day:'numeric'})}
             </span>
@@ -165,102 +264,15 @@ function MarkerCluster({ reports, selectedReport, setSelectedReport }) {
   // Recenter and zoom to marker if selectedReport changes
   useEffect(() => {
     if (selectedReport && map) {
-      map.setView([selectedReport.latitude, selectedReport.longitude], 16);
+      const lat = parseFloat(selectedReport.latitude);
+      const lng = parseFloat(selectedReport.longitude);
+      if (!isNaN(lat) && !isNaN(lng)) {
+        map.setView([lat, lng], 16);
+      }
     }
   }, [selectedReport, map]);
 
   return null;
-}
-
-// Footprint Overlay Component
-function FootprintLayer() {
-  const map = useMap();
-  const [footprints, setFootprints] = useState(null);
-  const fetchingRef = useRef(false);
-
-  useEffect(() => {
-    const fetchFootprints = async () => {
-      if (fetchingRef.current) return;
-      const bounds = map.getBounds();
-      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
-      const cacheKey = `bbox_${bounds.getSouth().toFixed(3)}_${bounds.getWest().toFixed(3)}_${bounds.getNorth().toFixed(3)}_${bounds.getEast().toFixed(3)}`;
-      
-      try {
-        fetchingRef.current = true;
-        const cached = await getFootprints(cacheKey);
-        if (cached) {
-          setFootprints(cached);
-          fetchingRef.current = false;
-          return;
-        }
-
-        if (map.getZoom() < 16) {
-          setFootprints(null);
-          fetchingRef.current = false;
-          return;
-        }
-
-        const query = `
-          [out:json][timeout:15];
-          (
-            way["building"](${bbox});
-            relation["building"](${bbox});
-          );
-          out body;
-          >;
-          out skel qt;
-        `;
-        
-        const res = await fetch('https://overpass-api.de/api/interpreter', {
-          method: 'POST',
-          body: query
-        });
-        
-        if (!res.ok) throw new Error('Overpass API failed');
-        const data = await res.json();
-        
-        const geojson = osmtogeojson(data);
-        setFootprints(geojson);
-        await saveFootprints(cacheKey, geojson);
-        
-      } catch (err) {
-        console.warn('Failed to fetch footprints:', err);
-      } finally {
-        fetchingRef.current = false;
-      }
-    };
-
-    let timer;
-    const triggerFetch = () => {
-      clearTimeout(timer);
-      timer = setTimeout(fetchFootprints, 1000);
-    };
-
-    map.on('moveend', triggerFetch);
-    map.on('zoomend', triggerFetch);
-    triggerFetch();
-
-    return () => {
-      map.off('moveend', triggerFetch);
-      map.off('zoomend', triggerFetch);
-      clearTimeout(timer);
-    };
-  }, [map]);
-
-  if (!footprints) return null;
-
-  return (
-    <GeoJSON 
-      data={footprints}
-      style={{
-        color: '#64748b', // Slate 500 for admin dashboard
-        weight: 1,
-        opacity: 0.5,
-        fillColor: '#334155', // Slate 700
-        fillOpacity: 0.3
-      }}
-    />
-  );
 }
 
 export default function Dashboard({ onLogout, onBackToUser }) {
@@ -270,6 +282,7 @@ export default function Dashboard({ onLogout, onBackToUser }) {
   const [selectedReport, setSelectedReport] = useState(null);
   const [loading, setLoading] = useState(true);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  const [showHeatmap, setShowHeatmap] = useState(false);
   const [toast, setToast] = useState(null);
   
   // Filter States
@@ -288,7 +301,8 @@ export default function Dashboard({ onLogout, onBackToUser }) {
     complete: 0,
     hasDebris: 0,
     duplicates: 0,
-    infraCounts: {}
+    infraCounts: {},
+    aiAgreementRate: null
   });
 
   // Toast helper
@@ -397,6 +411,7 @@ export default function Dashboard({ onLogout, onBackToUser }) {
     // Compute Stats
     let minimal = 0, partial = 0, complete = 0, hasDebris = 0, duplicates = 0;
     const infraCounts = {};
+    let aiTotal = 0, aiAgreed = 0;
 
     reports.forEach(r => {
       if (r.damage_level === 'Minimal/No damage') minimal++;
@@ -405,10 +420,19 @@ export default function Dashboard({ onLogout, onBackToUser }) {
       if (r.has_debris) hasDebris++;
       if (r.possible_duplicate) duplicates++;
 
+      if (r.ai_suggested_level) {
+        aiTotal++;
+        if (r.damage_level === r.ai_suggested_level) {
+          aiAgreed++;
+        }
+      }
+
       r.infrastructure_type.forEach(t => {
         infraCounts[t] = (infraCounts[t] || 0) + 1;
       });
     });
+
+    const aiAgreementRate = aiTotal > 0 ? Math.round((aiAgreed / aiTotal) * 100) : null;
 
     setStats({
       total: reports.length,
@@ -417,7 +441,8 @@ export default function Dashboard({ onLogout, onBackToUser }) {
       complete,
       hasDebris,
       duplicates,
-      infraCounts
+      infraCounts,
+      aiAgreementRate
     });
   }, [allReports, filterDamage, filterInfra, filterCrisis, filterStartDate, filterEndDate, showAllVersions]);
 
@@ -490,6 +515,14 @@ export default function Dashboard({ onLogout, onBackToUser }) {
             <h2 className="font-extrabold text-lg tracking-tight">Sentra Admin</h2>
           </div>
           <div className="flex items-center space-x-2">
+            <a 
+              href="/api/docs" 
+              target="_blank" 
+              rel="noreferrer"
+              className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors flex items-center gap-1"
+            >
+              API Docs
+            </a>
             <button
               onClick={onBackToUser}
               className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-slate-200 transition-colors"
@@ -682,6 +715,22 @@ export default function Dashboard({ onLogout, onBackToUser }) {
                 </div>
               </div>
 
+              {/* AI Agreement Rate Card */}
+              {stats.aiAgreementRate !== null && (
+                <div className="bg-slate-950/40 border border-slate-850 p-3 rounded-xl flex items-center justify-between">
+                  <div>
+                    <span className="text-[10px] text-slate-500 font-bold uppercase block flex items-center space-x-1">
+                      <Sparkles className="h-3 w-3 text-amber-500" />
+                      <span>AI vs Human Agreement</span>
+                    </span>
+                    <span className="block text-xl font-black text-amber-400 mt-1">{stats.aiAgreementRate}%</span>
+                    <p className="text-[9px] text-slate-500 mt-0.5 leading-tight">
+                      Percentage of users who accepted the AI's damage level suggestion
+                    </p>
+                  </div>
+                </div>
+              )}
+
               {/* Warnings card if any duplicates exist */}
               {stats.duplicates > 0 && (
                 <div className="bg-amber-500/10 border border-amber-500/20 p-3 rounded-xl flex items-center space-x-2 text-amber-300 text-xs">
@@ -789,15 +838,34 @@ export default function Dashboard({ onLogout, onBackToUser }) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          <FootprintLayer />
           
           {/* Custom Marker clustering logic */}
-          <MarkerCluster
-            reports={filteredReports}
-            selectedReport={selectedReport}
-            setSelectedReport={setSelectedReport}
-          />
+          {!showHeatmap && (
+            <MarkerCluster
+              reports={filteredReports}
+              selectedReport={selectedReport}
+              setSelectedReport={setSelectedReport}
+            />
+          )}
+
+          {/* Heatmap Layer */}
+          {showHeatmap && <HeatmapLayer reports={filteredReports} />}
         </MapContainer>
+
+        {/* Heatmap Toggle Button */}
+        <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[1000]">
+          <button
+            onClick={() => setShowHeatmap(!showHeatmap)}
+            className={`px-4 py-2 rounded-full font-bold shadow-lg flex items-center space-x-2 transition-all border ${
+              showHeatmap 
+                ? 'bg-amber-500 text-slate-900 border-amber-400' 
+                : 'bg-slate-900 text-white border-slate-700 hover:bg-slate-800'
+            }`}
+          >
+            <Layers className="h-4 w-4" />
+            <span>{showHeatmap ? 'Show Cluster Map' : 'Show Density Heatmap'}</span>
+          </button>
+        </div>
 
         {/* Floating Map Legend */}
         <div className="absolute bottom-6 left-6 z-[1000] bg-slate-950/75 backdrop-blur-md border border-slate-800/80 p-4 rounded-2xl shadow-2xl text-xs space-y-2 pointer-events-auto min-w-[180px]">
@@ -817,6 +885,10 @@ export default function Dashboard({ onLogout, onBackToUser }) {
           <div className="border-t border-slate-800/80 my-1.5 pt-1.5 flex items-center space-x-2">
             <span className="w-2.5 h-2.5 rounded-full border border-dashed border-slate-400 inline-block bg-slate-900/50"></span>
             <span className="text-slate-400 text-[9px]">Duplicate Report</span>
+          </div>
+          <div className="flex items-center space-x-2">
+            <span className="w-5 h-5 rounded-full bg-slate-600 border border-slate-400 flex items-center justify-center text-[10px] font-bold text-slate-200">?</span>
+            <span className="text-slate-400 text-[9px]">Landmark-only (no GPS)</span>
           </div>
         </div>
 
@@ -894,8 +966,17 @@ export default function Dashboard({ onLogout, onBackToUser }) {
               </div>
               {selectedReport.landmark_description && (
                 <div>
-                  <span className="text-slate-500 block uppercase font-bold text-[9px]">Nearby Landmark</span>
-                  <span className="text-slate-300">{selectedReport.landmark_description}</span>
+                  <span className="text-slate-500 block uppercase font-bold text-[9px]">Nearby Landmark / Address</span>
+                  <span className={`font-semibold block mt-0.5 ${
+                    !selectedReport.latitude ? 'text-yellow-300' : 'text-slate-300'
+                  }`}>
+                    {selectedReport.landmark_description}
+                  </span>
+                  {!selectedReport.latitude && (
+                    <span className="text-[9px] text-yellow-500/70 mt-0.5 block">
+                      ⚠ No GPS coordinates — location based on landmark only
+                    </span>
+                  )}
                 </div>
               )}
             </div>
@@ -956,3 +1037,7 @@ export default function Dashboard({ onLogout, onBackToUser }) {
     </div>
   );
 }
+
+// Default map center (Chennai) — used for landmark-only markers
+const DASHBOARD_CENTER_LAT = 13.0827;
+const DASHBOARD_CENTER_LNG = 80.2707;

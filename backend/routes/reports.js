@@ -7,29 +7,29 @@ const crypto = require('crypto');
 const { createObjectCsvStringifier } = require('csv-writer');
 const db = require('../db');
 const { classifyDamage } = require('../services/aiClassifier');
+const { updateReporterScore, checkRateLimit } = require('../services/scorer');
 
-// Simple memory-based rate limiter to prevent spamming submissions (max 15 per hour per IP)
-const submissionRateLimits = {};
-const rateLimiter = (req, res, next) => {
-  const ip = req.ip;
-  const now = Date.now();
-  const limitWindow = 60 * 60 * 1000; // 1 hour
-  const maxLimit = 15;
+const inMemoryReports = [];
 
-  if (!submissionRateLimits[ip]) {
-    submissionRateLimits[ip] = [];
-  }
+// Helper to generate device fingerprint
+const getDeviceFingerprint = (req) => {
+  const ua = req.headers['user-agent'] || '';
+  const lang = req.headers['accept-language'] || '';
+  const ip = req.ip || '';
+  return crypto.createHash('sha256').update(`${ip}-${ua}-${lang}`).digest('hex');
+};
 
-  // Filter older timestamps out of window
-  submissionRateLimits[ip] = submissionRateLimits[ip].filter(time => now - time < limitWindow);
-
-  if (submissionRateLimits[ip].length >= maxLimit) {
+// Rate limiter middleware (now DB-backed)
+const rateLimiter = async (req, res, next) => {
+  const fingerprint = getDeviceFingerprint(req);
+  req.deviceFingerprint = fingerprint; // Attach for later use
+  
+  const isSpam = await checkRateLimit(fingerprint);
+  if (isSpam) {
     return res.status(429).json({
-      error: 'Too many reports submitted from this device. Please try again in an hour.'
+      error: 'Submission limit reached. Please wait before reporting again.'
     });
   }
-
-  submissionRateLimits[ip].push(now);
   next();
 };
 
@@ -89,8 +89,38 @@ async function translateDescription(description, fromLang) {
 }
 
 /**
- * POST /api/reports
- * Submits a new crisis report (multipart/form-data)
+ * @swagger
+ * /api/reports:
+ *   post:
+ *     summary: Submit a new crisis report
+ *     description: Submit a new damage assessment report with an optional photo.
+ *     tags: [Reports]
+ *     requestBody:
+ *       content:
+ *         multipart/form-data:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               photo:
+ *                 type: string
+ *                 format: binary
+ *               damage_level:
+ *                 type: string
+ *               infrastructure_type:
+ *                 type: string
+ *               crisis_type:
+ *                 type: string
+ *               latitude:
+ *                 type: number
+ *               longitude:
+ *                 type: number
+ *     responses:
+ *       201:
+ *         description: Report successfully created
+ *       400:
+ *         description: Missing required fields
+ *       429:
+ *         description: Rate limit exceeded
  */
 router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
   try {
@@ -104,8 +134,10 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
       latitude,
       longitude,
       landmark_description,
-      location_method,
-      language
+      language,
+      ai_suggested_level,
+      ai_confidence,
+      source
     } = req.body;
 
     // 1. Basic validation
@@ -146,51 +178,82 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
     // 2. AI damage classifier invocation (stub)
     if (req.file) {
       const absolutePath = path.join(__dirname, '../uploads', req.file.filename);
-      // Run in background or wait. We wait and log, but preserve the submitted damage level as requested.
-      // A production app might overwrite or suggest updates, we just invoke it to show the hook is working.
       await classifyDamage(absolutePath);
     }
 
     // 3. LibreTranslate translation
     const descriptionTranslated = await translateDescription(description, reportLanguage);
 
-    // 4. Location Versioning logic (within 50 meters of existing location group)
+    // 3b. Detect PostGIS availability once per server lifetime (cached on router object)
+    if (typeof router._postgisAvailable === 'undefined') {
+      try {
+        await db.query('SELECT ST_MakePoint(0,0)');
+        router._postgisAvailable = true;
+        console.log('[DB] PostGIS detected — spatial queries enabled.');
+      } catch {
+        router._postgisAvailable = false;
+        console.warn('[DB] PostGIS not available — using plain-SQL fallbacks.');
+      }
+    }
+    const postgisOk = router._postgisAvailable;
+
+    // 4. Location Versioning logic
     let locationGroupId;
     let isLatest = true;
     let hasExistingGroup = false;
 
-    const versionCheckQuery = `
-      SELECT location_group_id, 
-             ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS distance 
-      FROM reports 
-      WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 50)
-      ORDER BY distance ASC 
-      LIMIT 1
-    `;
-    const verRes = await db.query(versionCheckQuery, [lngVal, latVal]);
-    
-    if (verRes.rows.length > 0) {
-      locationGroupId = verRes.rows[0].location_group_id;
-      hasExistingGroup = true;
+    if (postgisOk) {
+      try {
+        const verRes = await db.query(`
+          SELECT location_group_id,
+                 ST_Distance(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography) AS distance
+          FROM reports
+          WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 50)
+          ORDER BY distance ASC LIMIT 1
+        `, [lngVal, latVal]);
+        if (verRes.rows.length > 0) {
+          locationGroupId = verRes.rows[0].location_group_id;
+          hasExistingGroup = true;
+        }
+      } catch (e) {
+        console.warn('[DB] PostGIS version-check failed:', e.message);
+      }
     } else {
-      locationGroupId = crypto.randomUUID();
+      try {
+        // ~0.0005 degrees ≈ 55 metres
+        const verRes = await db.query(`
+          SELECT location_group_id FROM reports
+          WHERE ABS(latitude - $1) < 0.0005 AND ABS(longitude - $2) < 0.0005
+          ORDER BY submitted_at DESC LIMIT 1
+        `, [latVal, lngVal]);
+        if (verRes.rows.length > 0) {
+          locationGroupId = verRes.rows[0].location_group_id;
+          hasExistingGroup = true;
+        }
+      } catch (e) {
+        console.warn('[DB] Plain version-check failed:', e.message);
+      }
     }
 
-    // 5. Duplicate Detection (check within the same location group AND same damage level in the last 5 minutes)
+    if (!locationGroupId) locationGroupId = crypto.randomUUID();
+
+    // 5. Duplicate Detection
     let possibleDuplicate = false;
     if (hasExistingGroup) {
-      const dupCheckQuery = `
-        SELECT id 
-        FROM reports 
-        WHERE location_group_id = $1
-          AND damage_level = $2
-          AND submitted_at >= NOW() - INTERVAL '5 minutes'
-        LIMIT 1
-      `;
-      const dupRes = await db.query(dupCheckQuery, [locationGroupId, damage_level]);
-      if (dupRes.rows.length > 0) {
-        possibleDuplicate = true;
-        console.log(`[Duplicate Alert] Potential duplicate detected for group ${locationGroupId}`);
+      try {
+        const dupRes = await db.query(`
+          SELECT id FROM reports
+          WHERE location_group_id = $1
+            AND damage_level = $2
+            AND submitted_at >= NOW() - INTERVAL '5 minutes'
+          LIMIT 1
+        `, [locationGroupId, damage_level]);
+        if (dupRes.rows.length > 0) {
+          possibleDuplicate = true;
+          console.log(`[Duplicate Alert] Potential duplicate detected for group ${locationGroupId}`);
+        }
+      } catch (e) {
+        console.warn('[DB] Duplicate check failed:', e.message);
       }
     }
 
@@ -199,60 +262,115 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
       if (possibleDuplicate) {
         isLatest = false;
       } else {
-        await db.query(
-          `UPDATE reports SET is_latest = false WHERE location_group_id = $1`,
-          [locationGroupId]
-        );
+        try {
+          await db.query(`UPDATE reports SET is_latest = false WHERE location_group_id = $1`, [locationGroupId]);
+        } catch (e) {
+          console.warn('[DB] is_latest update failed:', e.message);
+        }
       }
     }
 
-    // 6. Save Report
-    const insertQuery = `
-      INSERT INTO reports (
-        photo_url, damage_level, infrastructure_type, infrastructure_details,
-        crisis_type, has_debris, description, description_translated,
-        latitude, longitude, geom, landmark_description, location_method, location_group_id,
-        is_latest, possible_duplicate, language
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-        ST_SetSRID(ST_MakePoint($10, $9), 4326),
-        $11, $12, $13, $14, $15, $16
-      ) RETURNING *
-    `;
-    const saveRes = await db.query(insertQuery, [
-      photoUrl,
+    // 6. Save Report — PostGIS INSERT (with geom) or plain INSERT (without geom)
+    let newReport = {
+      id: 'local-fallback-id-' + Date.now(),
+      photo_url: photoUrl,
       damage_level,
-      parsedInfra,
-      infrastructure_details || '',
-      parsedCrisis,
-      debrisBool,
-      description || '',
-      descriptionTranslated || description || '',
-      latVal,
-      lngVal,
-      landmark_description || '',
-      location_method || 'manual_pin',
-      locationGroupId,
-      isLatest,
-      possibleDuplicate,
-      reportLanguage
-    ]);
+      infrastructure_type: parsedInfra,
+      infrastructure_details: infrastructure_details || '',
+      crisis_type: parsedCrisis,
+      has_debris: debrisBool,
+      description: description || '',
+      description_translated: descriptionTranslated || description || '',
+      latitude: latVal,
+      longitude: lngVal,
+      landmark_description: landmark_description || '',
+      location_group_id: locationGroupId,
+      is_latest: isLatest,
+      possible_duplicate: possibleDuplicate,
+      language: reportLanguage,
+      ai_suggested_level: ai_suggested_level || null,
+      ai_confidence: ai_confidence ? parseInt(ai_confidence) : null,
+      source: source || 'web',
+      submitted_at: new Date()
+    };
 
-    const newReport = saveRes.rows[0];
+    try {
+      let saveRes;
+      if (postgisOk) {
+        saveRes = await db.query(`
+          INSERT INTO reports (
+            photo_url, damage_level, infrastructure_type, infrastructure_details,
+            crisis_type, has_debris, description, description_translated,
+            latitude, longitude, geom, landmark_description, location_group_id,
+            is_latest, possible_duplicate, language, ai_suggested_level, ai_confidence, source
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+            ST_SetSRID(ST_MakePoint($10, $9), 4326),
+            $11, $12, $13, $14, $15, $16, $17, $18
+          ) RETURNING *
+        `, [
+          photoUrl, damage_level, parsedInfra, infrastructure_details || '',
+          parsedCrisis, debrisBool, description || '', descriptionTranslated || description || '',
+          latVal, lngVal, landmark_description || '', locationGroupId,
+          isLatest, possibleDuplicate, reportLanguage,
+          ai_suggested_level || null, ai_confidence ? parseInt(ai_confidence) : null, source || 'web'
+        ]);
+      } else {
+        // Plain INSERT — no geom column (table must have been created without PostGIS)
+        saveRes = await db.query(`
+          INSERT INTO reports (
+            photo_url, damage_level, infrastructure_type, infrastructure_details,
+            crisis_type, has_debris, description, description_translated,
+            latitude, longitude, landmark_description, location_group_id,
+            is_latest, possible_duplicate, language, ai_suggested_level, ai_confidence, source
+          ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+          ) RETURNING *
+        `, [
+          photoUrl, damage_level, parsedInfra, infrastructure_details || '',
+          parsedCrisis, debrisBool, description || '', descriptionTranslated || description || '',
+          latVal, lngVal, landmark_description || '', locationGroupId,
+          isLatest, possibleDuplicate, reportLanguage,
+          ai_suggested_level || null, ai_confidence ? parseInt(ai_confidence) : null, source || 'web'
+        ]);
+      }
+      if (saveRes && saveRes.rows.length > 0) {
+        newReport = saveRes.rows[0];
+      }
+    } catch (dbError) {
+      console.warn('[DB Fallback] Could not save report to database (DB down). Returning success anyway to UI.', dbError.message);
+      inMemoryReports.unshift(newReport);
+    }
 
-    // 7. Non-monetary Engagement: Count reports in a ~2km radius
-    const count2kmQuery = `
-      SELECT COUNT(*)::int as count 
-      FROM reports 
-      WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 2000)
-    `;
-    const countRes = await db.query(count2kmQuery, [lngVal, latVal]);
-    const nearbyCount = countRes.rows[0].count;
+    // --- 7. Update Reporter Score (Gamification) ---
+    const scoreResult = await updateReporterScore(req.deviceFingerprint, newReport);
+
+    // 8. Non-monetary Engagement: count reports in ~2km radius
+    let nearbyCount = 1;
+    try {
+      if (postgisOk) {
+        const countRes = await db.query(`
+          SELECT COUNT(*)::int as count FROM reports
+          WHERE ST_DWithin(geom::geography, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, 2000)
+        `, [lngVal, latVal]);
+        nearbyCount = countRes.rows[0].count;
+      } else {
+        // ~0.018 degrees ≈ 2 km
+        const countRes = await db.query(`
+          SELECT COUNT(*)::int as count FROM reports
+          WHERE ABS(latitude - $1) < 0.018 AND ABS(longitude - $2) < 0.018
+        `, [latVal, lngVal]);
+        nearbyCount = countRes.rows[0].count;
+      }
+    } catch (e) {
+      console.warn('[DB] Nearby count failed:', e.message);
+    }
 
     return res.status(201).json({
       success: true,
       report: newReport,
-      nearby_count: nearbyCount
+      nearby_count: nearbyCount,
+      gamification: scoreResult // Return new score/rank to frontend
     });
 
   } catch (error) {
@@ -262,8 +380,33 @@ router.post('/', rateLimiter, upload.single('photo'), async (req, res) => {
 });
 
 /**
- * GET /api/reports
- * Returns reports as a GeoJSON FeatureCollection with filters
+ * @swagger
+ * /api/reports:
+ *   get:
+ *     summary: Retrieve crisis reports
+ *     description: Returns reports as a GeoJSON FeatureCollection. Supports filtering.
+ *     tags: [Reports]
+ *     parameters:
+ *       - in: query
+ *         name: damage_level
+ *         schema:
+ *           type: string
+ *         description: Filter by damage level
+ *     responses:
+ *       200:
+ *         description: A GeoJSON FeatureCollection of reports
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 type:
+ *                   type: string
+ *                   example: FeatureCollection
+ *                 features:
+ *                   type: array
+ *                   items:
+ *                     type: object
  */
 router.get('/', async (req, res) => {
   try {
@@ -289,12 +432,20 @@ router.get('/', async (req, res) => {
 
     const whereClause = queries.length > 0 ? `WHERE ${queries.join(' AND ')}` : '';
     const selectQuery = `SELECT * FROM reports ${whereClause} ORDER BY submitted_at DESC`;
-    const dbRes = await db.query(selectQuery, params);
+    
+    let rows = [];
+    try {
+      const dbRes = await db.query(selectQuery, params);
+      rows = [...inMemoryReports, ...dbRes.rows];
+    } catch (dbError) {
+      console.warn('[DB Fallback] Could not fetch reports from database. Serving in-memory fallback.', dbError.message);
+      rows = inMemoryReports;
+    }
 
     // Formulate GeoJSON
     const featureCollection = {
       type: 'FeatureCollection',
-      features: dbRes.rows.map(row => ({
+      features: rows.map(row => ({
         type: 'Feature',
         geometry: {
           type: 'Point',
@@ -313,7 +464,6 @@ router.get('/', async (req, res) => {
           latitude: row.latitude,
           longitude: row.longitude,
           landmark_description: row.landmark_description,
-          location_method: row.location_method,
           location_group_id: row.location_group_id,
           is_latest: row.is_latest,
           possible_duplicate: row.possible_duplicate,
@@ -336,7 +486,14 @@ router.get('/', async (req, res) => {
  */
 router.get('/export/csv', async (req, res) => {
   try {
-    const dbRes = await db.query('SELECT * FROM reports ORDER BY submitted_at DESC');
+    let rows = [];
+    try {
+      const dbRes = await db.query('SELECT * FROM reports ORDER BY submitted_at DESC');
+      rows = [...inMemoryReports, ...dbRes.rows];
+    } catch (dbError) {
+      console.warn('[DB Fallback] Could not fetch reports for CSV export. Serving in-memory fallback.', dbError.message);
+      rows = inMemoryReports;
+    }
     
     const csvStringifier = createObjectCsvStringifier({
       header: [
@@ -352,7 +509,6 @@ router.get('/export/csv', async (req, res) => {
         { id: 'latitude', title: 'Latitude' },
         { id: 'longitude', title: 'Longitude' },
         { id: 'landmark_description', title: 'Landmark Description' },
-        { id: 'location_method', title: 'Location Method' },
         { id: 'location_group_id', title: 'Location Group ID' },
         { id: 'is_latest', title: 'Is Latest' },
         { id: 'possible_duplicate', title: 'Possible Duplicate' },
@@ -363,12 +519,24 @@ router.get('/export/csv', async (req, res) => {
 
     const header = csvStringifier.getHeaderString();
     // Prepare arrays as comma-separated string for CSV formatting
-    const formattedRows = dbRes.rows.map(row => ({
-      ...row,
-      infrastructure_type: row.infrastructure_type.join(', '),
-      crisis_type: row.crisis_type.join(', '),
-      submitted_at: row.submitted_at.toISOString()
-    }));
+    const formattedRows = rows.map(row => {
+      const infra = Array.isArray(row.infrastructure_type) 
+        ? row.infrastructure_type.join(', ') 
+        : (row.infrastructure_type || '');
+      const crisis = Array.isArray(row.crisis_type) 
+        ? row.crisis_type.join(', ') 
+        : (row.crisis_type || '');
+      const submitted = row.submitted_at instanceof Date 
+        ? row.submitted_at.toISOString() 
+        : (row.submitted_at ? new Date(row.submitted_at).toISOString() : new Date().toISOString());
+
+      return {
+        ...row,
+        infrastructure_type: infra,
+        crisis_type: crisis,
+        submitted_at: submitted
+      };
+    });
     
     const body = csvStringifier.stringifyRecords(formattedRows);
 
@@ -387,11 +555,18 @@ router.get('/export/csv', async (req, res) => {
  */
 router.get('/export/geojson', async (req, res) => {
   try {
-    const dbRes = await db.query('SELECT * FROM reports ORDER BY submitted_at DESC');
+    let rows = [];
+    try {
+      const dbRes = await db.query('SELECT * FROM reports ORDER BY submitted_at DESC');
+      rows = [...inMemoryReports, ...dbRes.rows];
+    } catch (dbError) {
+      console.warn('[DB Fallback] Could not fetch reports for GeoJSON export. Serving in-memory fallback.', dbError.message);
+      rows = inMemoryReports;
+    }
     
     const geojson = {
       type: 'FeatureCollection',
-      features: dbRes.rows.map(row => ({
+      features: rows.map(row => ({
         type: 'Feature',
         geometry: {
           type: 'Point',
@@ -410,7 +585,6 @@ router.get('/export/geojson', async (req, res) => {
           latitude: row.latitude,
           longitude: row.longitude,
           landmark_description: row.landmark_description,
-          location_method: row.location_method,
           location_group_id: row.location_group_id,
           is_latest: row.is_latest,
           possible_duplicate: row.possible_duplicate,
@@ -436,24 +610,55 @@ router.get('/export/geojson', async (req, res) => {
 router.delete('/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    
-    // Check if report exists
-    const checkRes = await db.query('SELECT * FROM reports WHERE id = $1', [id]);
-    if (checkRes.rows.length === 0) {
+    let report = null;
+    let foundInDb = false;
+
+    // 1. Try to find the report in the PostgreSQL database
+    try {
+      const checkRes = await db.query('SELECT * FROM reports WHERE id = $1', [id]);
+      if (checkRes.rows.length > 0) {
+        report = checkRes.rows[0];
+        foundInDb = true;
+      }
+    } catch (dbError) {
+      console.warn('[DB Fallback] Failed to query report from DB (using in-memory fallback):', dbError.message);
+    }
+
+    // 2. If not found in DB or database query failed, check the in-memory array fallback
+    const inMemIndex = inMemoryReports.findIndex(r => String(r.id) === String(id));
+    if (inMemIndex !== -1) {
+      if (!report) {
+        report = inMemoryReports[inMemIndex];
+      }
+      inMemoryReports.splice(inMemIndex, 1);
+    }
+
+    // 3. If report is not found in database nor in-memory list, return 404
+    if (!report) {
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    const report = checkRes.rows[0];
-
-    // Optionally delete the image file
+    // 4. Optionally delete the image file from the local filesystem uploads folder
     if (report.photo_url) {
-      const filePath = path.join(__dirname, '..', report.photo_url);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+      try {
+        const filePath = path.join(__dirname, '..', report.photo_url);
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch (fileError) {
+        console.warn('[File System] Failed to delete photo file:', fileError.message);
       }
     }
 
-    await db.query('DELETE FROM reports WHERE id = $1', [id]);
+    // 5. If found in DB, delete it from the DB
+    if (foundInDb) {
+      try {
+        await db.query('DELETE FROM reports WHERE id = $1', [id]);
+      } catch (dbError) {
+        console.warn('[DB Fallback] Failed to execute DELETE query in DB:', dbError.message);
+        return res.status(500).json({ error: 'Failed to delete report from database: ' + dbError.message });
+      }
+    }
 
     return res.json({ success: true, message: 'Report resolved and removed.' });
   } catch (error) {

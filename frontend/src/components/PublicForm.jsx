@@ -1,13 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { MapContainer, TileLayer, Marker, GeoJSON, useMapEvents, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, useMapEvents, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import { 
   Camera, MapPin, Globe, Check, AlertTriangle, CloudOff, 
   Sparkles, CheckCircle2, ChevronRight, RefreshCw, LogIn, ChevronLeft
 } from 'lucide-react';
-import osmtogeojson from 'osmtogeojson';
-import { saveReportOffline, getOfflineCount, saveFootprints, getFootprints } from '../utils/indexedDb';
+import { saveReportOffline, getOfflineCount } from '../utils/indexedDb';
+import { useAIClassifier } from '../hooks/useAIClassifier';
+import ScoreToast from './ScoreToast';
+import Leaderboard from './Leaderboard';
 
 // Leaflet default icon fix
 delete L.Icon.Default.prototype._getIconUrl;
@@ -36,116 +38,6 @@ function RecenterMap({ position }) {
     }
   }, [position, map]);
   return null;
-}
-
-// Footprint Overlay Component
-function FootprintLayer({ onBuildingClick }) {
-  const map = useMap();
-  const [footprints, setFootprints] = useState(null);
-  const fetchingRef = useRef(false);
-
-  useEffect(() => {
-    const fetchFootprints = async () => {
-      if (fetchingRef.current) return;
-      const bounds = map.getBounds();
-      // bbox format for Overpass: (south, west, north, east)
-      const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
-      
-      // Simple cache key: round coordinates to reduce granularity 
-      const cacheKey = `bbox_${bounds.getSouth().toFixed(3)}_${bounds.getWest().toFixed(3)}_${bounds.getNorth().toFixed(3)}_${bounds.getEast().toFixed(3)}`;
-      
-      try {
-        fetchingRef.current = true;
-        const cached = await getFootprints(cacheKey);
-        if (cached) {
-          setFootprints(cached);
-          fetchingRef.current = false;
-          return;
-        }
-
-        // Only fetch if zoom is high enough to avoid massive downloads
-        if (map.getZoom() < 16) {
-          setFootprints(null);
-          fetchingRef.current = false;
-          return;
-        }
-
-        const query = `
-          [out:json][timeout:15];
-          (
-            way["building"](${bbox});
-            relation["building"](${bbox});
-          );
-          out body;
-          >;
-          out skel qt;
-        `;
-        
-        const res = await fetch('https://overpass-api.de/api/interpreter', {
-          method: 'POST',
-          body: query
-        });
-        
-        if (!res.ok) throw new Error('Overpass API failed');
-        const data = await res.json();
-        
-        const geojson = osmtogeojson(data);
-        setFootprints(geojson);
-        await saveFootprints(cacheKey, geojson);
-        
-      } catch (err) {
-        console.warn('Failed to fetch footprints:', err);
-      } finally {
-        fetchingRef.current = false;
-      }
-    };
-
-    // Debounce triggers
-    let timer;
-    const triggerFetch = () => {
-      clearTimeout(timer);
-      timer = setTimeout(fetchFootprints, 1000);
-    };
-
-    map.on('moveend', triggerFetch);
-    map.on('zoomend', triggerFetch);
-    
-    // Initial fetch
-    triggerFetch();
-
-    return () => {
-      map.off('moveend', triggerFetch);
-      map.off('zoomend', triggerFetch);
-      clearTimeout(timer);
-    };
-  }, [map]);
-
-  if (!footprints) return null;
-
-  return (
-    <GeoJSON 
-      data={footprints}
-      style={{
-        color: '#3b82f6',
-        weight: 2,
-        opacity: 0.8,
-        fillColor: '#3b82f6',
-        fillOpacity: 0.2
-      }}
-      onEachFeature={(feature, layer) => {
-        layer.on('click', (e) => {
-          L.DomEvent.stopPropagation(e); // Prevent map click from overriding
-          let latlng;
-          if (layer.getBounds) {
-            latlng = layer.getBounds().getCenter();
-          } else {
-            latlng = e.latlng;
-          }
-          onBuildingClick(latlng.lat, latlng.lng);
-        });
-      }}
-    />
-  );
 }
 
 const LANGUAGES = [
@@ -217,7 +109,6 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
   const [hasDebris, setHasDebris] = useState(false);
   const [description, setDescription] = useState('');
   const [location, setLocation] = useState(null); // { lat, lng }
-  const [locationMethod, setLocationMethod] = useState('manual_pin');
   const [landmarkDesc, setLandmarkDesc] = useState('');
   
   // UI & Network State
@@ -225,10 +116,20 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
   const [loading, setLoading] = useState(false);
   const [showSuccess, setShowSuccess] = useState(false);
   const [nearbyCount, setNearbyCount] = useState(0);
+
+  // AI Classifier State
+  const { isModelLoading, classifyImage, isReady } = useAIClassifier();
+  const [aiSuggestion, setAiSuggestion] = useState(null);
+  const [aiConfidence, setAiConfidence] = useState(null);
+  const [aiRawClass, setAiRawClass] = useState(null);
+  const [isInferencing, setIsInferencing] = useState(false);
+  const [gamificationData, setGamificationData] = useState(null);
+
   const [offlineCount, setOfflineCount] = useState(0);
   const [gpsLoading, setGpsLoading] = useState(false);
   const [gpsErrorMsg, setGpsErrorMsg] = useState('');
   const [gpsSuccessMsg, setGpsSuccessMsg] = useState('');
+  const [gpsUnavailable, setGpsUnavailable] = useState(false); // true when GPS fails/denied
   const [userReports, setUserReports] = useState([]);
   const [selectedReport, setSelectedReport] = useState(null);
   const [showEmergencySent, setShowEmergencySent] = useState(false);
@@ -437,6 +338,24 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
   const handlePhotoSelect = async (e) => {
     const file = e.target.files[0];
     if (file) {
+      
+      const runAI = (resultSrc) => {
+        if (!isReady) return;
+        setIsInferencing(true);
+        const img = new Image();
+        img.onload = async () => {
+          const res = await classifyImage(img);
+          if (res) {
+            setAiSuggestion(res.level);
+            setAiConfidence(res.confidence);
+            setAiRawClass(res.rawClass);
+            setDamageLevel(res.level); // Pre-select
+          }
+          setIsInferencing(false);
+        };
+        img.src = resultSrc;
+      };
+
       try {
         const compressedFile = await compressImage(file);
         setPhoto(compressedFile);
@@ -444,6 +363,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         reader.onloadend = () => {
           setPhotoPreview(reader.result);
           setMode('form');
+          runAI(reader.result);
         };
         reader.readAsDataURL(compressedFile);
       } catch (err) {
@@ -453,6 +373,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         reader.onloadend = () => {
           setPhotoPreview(reader.result);
           setMode('form');
+          runAI(reader.result);
         };
         reader.readAsDataURL(file);
       }
@@ -499,9 +420,11 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
     setGpsLoading(true);
     setGpsErrorMsg('');
     setGpsSuccessMsg('');
+    setGpsUnavailable(false);
     
     if (!navigator.geolocation) {
       setGpsErrorMsg(t('gps_error', 'Geolocation is not supported by your browser.'));
+      setGpsUnavailable(true);
       setGpsLoading(false);
       return;
     }
@@ -510,13 +433,14 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       (position) => {
         const { latitude, longitude } = position.coords;
         setLocation({ lat: latitude, lng: longitude });
-        setLocationMethod('manual_pin');
         setGpsSuccessMsg(t('gps_success'));
+        setGpsUnavailable(false);
         setGpsLoading(false);
       },
       (error) => {
         console.warn('Geolocation error:', error);
-        setGpsErrorMsg(t('gps_error'));
+        setGpsErrorMsg(t('gps_error', 'GPS unavailable — location access was denied or timed out.'));
+        setGpsUnavailable(true); // auto-reveal landmark fallback
         setGpsLoading(false);
       },
       { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 }
@@ -569,13 +493,14 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       latitude: submitLat,
       longitude: submitLng,
       landmark_description: landmarkDesc,
-      location_method: locationMethod,
-      language: i18n.language || 'en'
+      language: i18n.language || 'en',
+      ai_suggested_level: aiSuggestion,
+      ai_confidence: aiConfidence
     };
 
     const reportRecord = {
       id: `${Date.now()}`,
-      photo: photoPreview,
+      photo: photoPreview || null, // Storing locally compressed preview
       damage_level: damageLevel,
       infrastructure_type: selectedInfra,
       infrastructure_details: infraDetails,
@@ -585,9 +510,10 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
       latitude: submitLat,
       longitude: submitLng,
       landmark_description: landmarkDesc,
-      location_method: locationMethod,
       submitted_at: new Date().toISOString(),
-      syncStatus: isOnline ? 'SYNCED' : 'PENDING SYNC'
+      syncStatus: isOnline ? 'SYNCED' : 'PENDING SYNC',
+      ai_suggested_level: aiSuggestion,
+      ai_confidence: aiConfidence
     };
 
     setLoading(true);
@@ -615,32 +541,44 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         if (response.ok) {
           const data = await response.json();
           setNearbyCount(data.nearby_count || 1);
-          persistUserReports([reportRecord, ...userReports]);
+          if (data.gamification) setGamificationData(data.gamification);
+          
+          const syncedRecord = {
+            ...reportRecord,
+            id: data.report?.id || reportRecord.id,
+            photo_url: data.report?.photo_url || null,
+            syncStatus: 'SYNCED'
+          };
+          persistUserReports([syncedRecord, ...userReports]);
           setShowSuccess(true);
           resetForm();
         } else {
           const errData = await response.json();
+          if (response.status === 429) {
+            alert(errData.error || 'Submission limit reached.');
+            return; // Don't fall back to offline for spam
+          }
           throw new Error(errData.error || 'Upload failed');
         }
       } catch (err) {
         console.warn('Online submit failed, saving to offline store as fallback:', err);
-        await saveOffline(payload);
+        await saveOffline(payload, false); // don't show alert when falling back online
       } finally {
         setLoading(false);
       }
     } else {
-      await saveOffline(payload);
+      await saveOffline(payload, true); // show alert only when genuinely offline
       setLoading(false);
     }
   };
 
-  const saveOffline = async (payload) => {
+  const saveOffline = async (payload, showAlert = true) => {
     try {
-      await saveReportOffline(payload, photo);
+      await saveReportOffline(payload, photoPreview);
       persistUserReports([
         {
           id: `${Date.now()}`,
-          photo: photoPreview,
+          photo: photoPreview || null, // Storing locally compressed preview
           damage_level: payload.damage_level,
           infrastructure_type: payload.infrastructure_type,
           infrastructure_details: payload.infrastructure_details,
@@ -650,14 +588,15 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           latitude: payload.latitude,
           longitude: payload.longitude,
           landmark_description: payload.landmark_description,
-          location_method: payload.location_method,
           submitted_at: new Date().toISOString(),
           syncStatus: 'PENDING SYNC'
         },
         ...userReports
       ]);
       await updateOfflineQueueCount();
-      alert(t('submit_offline'));
+      if (showAlert) {
+        alert(t('submit_offline'));
+      }
       resetForm();
       setNearbyCount(0); 
       setShowSuccess(true);
@@ -678,7 +617,11 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
     setDescription('');
     setLocation(null);
     setLandmarkDesc('');
+    setGpsUnavailable(false);
+    setGpsErrorMsg('');
+    setGpsSuccessMsg('');
     setStep(1);
+    setMode('map'); // return to home map after submit
   };
 
   // Step Indicators Layout
@@ -796,7 +739,30 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
 
       {/* Damage Classification Cards */}
       <div className="space-y-2">
-        <label className="block text-xs font-bold uppercase text-slate-400 tracking-wider">{t('damage_level')}</label>
+        <div className="flex items-center justify-between">
+          <label className="block text-xs font-bold uppercase text-slate-400 tracking-wider">{t('damage_level')}</label>
+          {isInferencing && (
+            <div className="flex items-center space-x-1.5 text-xs text-blue-400">
+              <RefreshCw className="h-3 w-3 animate-spin" />
+              <span>AI Analyzing...</span>
+            </div>
+          )}
+        </div>
+        
+        {aiSuggestion && !isInferencing && (
+          <div className="mb-2 p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 flex items-start space-x-2">
+            <Sparkles className="h-4 w-4 text-amber-400 mt-0.5 flex-shrink-0" />
+            <div className="flex-1">
+              <p className="text-xs text-amber-300 font-bold leading-tight">
+                🤖 AI Suggestion: {aiSuggestion.split('/')[0]} ({aiConfidence}%)
+              </p>
+              <p className="text-[10px] text-amber-400/70 mt-0.5">
+                Detected: {aiRawClass}. You can override this suggestion.
+              </p>
+            </div>
+          </div>
+        )}
+
         <div className="space-y-2">
           {/* Minimal */}
           <button
@@ -974,19 +940,31 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         </button>
 
         {gpsSuccessMsg && (
-          <div className="text-xs text-emerald-400 font-semibold flex items-center space-x-1.5 bg-emerald-500/10 border border-emerald-500/20 p-2 rounded-lg">
-            <Check className="h-4 w-4" />
+          <div className="text-xs text-emerald-400 font-semibold flex items-center space-x-1.5 bg-emerald-500/10 border border-emerald-500/20 p-2.5 rounded-lg">
+            <Check className="h-4 w-4 flex-shrink-0" />
             <span>{gpsSuccessMsg}</span>
           </div>
         )}
-
-        {gpsErrorMsg && (
-          <div className="text-xs text-amber-400 font-semibold flex items-center space-x-1.5 bg-amber-500/10 border border-amber-500/20 p-2 rounded-lg">
-            <AlertTriangle className="h-4 w-4" />
-            <span>{gpsErrorMsg}</span>
-          </div>
-        )}
       </div>
+
+      {/* ── GPS UNAVAILABLE BANNER (shown automatically on failure) ── */}
+      {gpsUnavailable && !location && (
+        <div
+          id="gps-unavailable-banner"
+          role="alert"
+          className="flex items-start space-x-3 p-4 rounded-2xl bg-yellow-400/15 border-2 border-yellow-400/60 shadow-lg shadow-yellow-500/10 animate-pulse-once"
+        >
+          <AlertTriangle className="h-5 w-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="text-sm font-extrabold text-yellow-300 leading-snug">
+              GPS unavailable — please describe your location below
+            </p>
+            <p className="text-[11px] text-yellow-400/80 mt-0.5">
+              {gpsErrorMsg || 'Location access was denied or could not be determined.'}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Leaflet Map */}
       <div className="h-64 rounded-2xl overflow-hidden border border-slate-800 relative z-0">
@@ -1001,17 +979,8 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
-          <FootprintLayer 
-            onBuildingClick={(lat, lng) => {
-              setLocation({ lat, lng });
-              setLocationMethod('footprint');
-            }}
-          />
-          <MapEventsHandler onMapClick={(lat, lng) => {
-            setLocation({ lat, lng });
-            setLocationMethod('manual_pin');
-          }} />
-          <RecenterMap position={location} />
+          <MapEventsHandler onMapClick={(lat, lng) => { setLocation({ lat, lng }); setGpsUnavailable(false); }} />
+          {location && <RecenterMap position={[location.lat, location.lng]} />}
           {location && (
             <Marker position={[location.lat, location.lng]} />
           )}
@@ -1021,27 +990,56 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         {t('map_manual_instruction', 'Tap anywhere on the map above to manually drop a pin at the location of damage.')}
       </p>
 
-      {/* Landmark Fallback */}
-      {(!location) && (
-        <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/20 space-y-2">
-          <div className="flex items-start space-x-2 text-amber-400">
-            <AlertTriangle className="h-5 w-5 flex-shrink-0" />
-            <span className="text-xs font-semibold">{t('landmark_info')}</span>
-          </div>
+      {/* ── Landmark fallback field ── */}
+      {/* Show when: GPS unavailable OR no location set yet */}
+      {(gpsUnavailable || !location) && (
+        <div
+          id="landmark-fallback-section"
+          className={`p-4 rounded-2xl space-y-3 transition-all ${
+            gpsUnavailable && !location
+              ? 'bg-yellow-400/10 border-2 border-yellow-400/40'      // prominent when GPS failed
+              : 'bg-amber-500/10 border border-amber-500/20'          // subtle when user just hasn't picked
+          }`}
+        >
+          {!gpsUnavailable && (
+            <div className="flex items-start space-x-2 text-amber-400">
+              <AlertTriangle className="h-5 w-5 flex-shrink-0" />
+              <span className="text-xs font-semibold">{t('landmark_info', 'No pin dropped yet. Describe a nearby landmark instead.')}</span>
+            </div>
+          )}
           <div>
-            <label className="block text-xs font-bold uppercase text-slate-400 mb-1">{t('landmark_fallback')}</label>
-            <input 
+            <label
+              htmlFor="landmark-desc-input"
+              className={`block text-xs font-bold uppercase mb-1.5 ${
+                gpsUnavailable && !location ? 'text-yellow-300' : 'text-slate-400'
+              }`}
+            >
+              Nearest Landmark or Address Description
+              {!location && <span className="text-red-400 ml-1">*</span>}
+            </label>
+            <input
+              id="landmark-desc-input"
               type="text"
               value={landmarkDesc}
               onChange={(e) => setLandmarkDesc(e.target.value)}
               required={!location}
-              placeholder={t('landmark_placeholder')}
-              className="w-full h-12 px-4 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-1 focus:ring-blue-500 outline-none"
+              placeholder="e.g. Near the blue mosque on Main Street, 2nd block from the market"
+              className={`w-full h-12 px-4 bg-slate-900 rounded-xl text-white text-sm focus:ring-2 outline-none transition-all ${
+                gpsUnavailable && !location
+                  ? 'border-2 border-yellow-400/60 focus:ring-yellow-400/40 placeholder-yellow-900'
+                  : 'border border-slate-700 focus:ring-blue-500'
+              }`}
             />
+            {!location && (
+              <p className="text-[10px] text-slate-500 mt-1">
+                Required when no map pin or GPS fix is available.
+              </p>
+            )}
           </div>
         </div>
       )}
 
+      {/* Optional landmark when a pin IS set */}
       {location && (
         <div className="space-y-1">
           <label className="block text-xs font-bold uppercase text-slate-500">{t('landmark_optional', 'Nearby Landmark (Optional)')}</label>
@@ -1068,6 +1066,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           onClick={() => {
             if (!location && !landmarkDesc.trim()) {
               alert(t('alert_location_required', 'Please pinpoint a location on the map or describe a nearby landmark.'));
+              document.getElementById('landmark-desc-input')?.focus();
               return;
             }
             setStep(4);
@@ -1326,7 +1325,10 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
           
           <div className="pt-6">
             <button
-              onClick={() => setShowSuccess(false)}
+              onClick={() => {
+                setShowSuccess(false);
+                setMode('map'); // go back to map home page
+              }}
               className="w-full h-14 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white font-bold rounded-2xl transition-all shadow-lg shadow-emerald-600/20 min-h-[44px]"
             >
               {t('success_done')}
@@ -1501,7 +1503,11 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
                   className="cursor-pointer bg-white rounded-2xl p-4 shadow-sm border border-slate-200 flex items-center space-x-4 hover:border-blue-300 hover:shadow-md transition-all"
                 >
                   <div className="h-16 w-16 bg-slate-100 rounded-xl overflow-hidden flex items-center justify-center text-xs text-slate-400 flex-shrink-0">
-                    {report.photo ? <img src={report.photo} alt="Report preview" className="h-full w-full object-cover" /> : 'Thumb'}
+                    {report.photo_url || report.photo ? (
+                      <img src={report.photo_url || report.photo} alt="Report preview" className="h-full w-full object-cover" />
+                    ) : (
+                      'Thumb'
+                    )}
                   </div>
                   <div className="flex-1">
                     <div className="font-semibold text-slate-900">{report.damage_level || 'Damage Report'}</div>
@@ -1519,6 +1525,10 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
                   No local reports yet. Take a photo and submit one to see it here.
                 </div>
               )}
+            </div>
+
+            <div className="mt-8">
+              <Leaderboard />
             </div>
           </div>
         )}
@@ -1572,8 +1582,8 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
               </div>
 
               <div className="rounded-2xl overflow-hidden border border-slate-200 bg-slate-50">
-                {selectedReport.photo ? (
-                  <img src={selectedReport.photo} alt="Selected report" className="w-full h-64 object-cover" />
+                {selectedReport.photo_url || selectedReport.photo ? (
+                  <img src={selectedReport.photo_url || selectedReport.photo} alt="Selected report" className="w-full h-64 object-cover" />
                 ) : (
                   <div className="h-64 flex items-center justify-center text-slate-400">No photo available</div>
                 )}
@@ -1639,6 +1649,7 @@ export default function PublicForm({ onNavigateToLogin, onNavigateToAdmin }) {
         onChange={handlePhotoSelect} 
         className="hidden"
       />
+      <ScoreToast gamification={gamificationData} onClose={() => setGamificationData(null)} />
     </div>
   );
 }

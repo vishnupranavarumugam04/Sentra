@@ -20,7 +20,6 @@ CREATE TABLE reports (
     longitude DOUBLE PRECISION NOT NULL,
     geom GEOMETRY(POINT, 4326) NOT NULL,
     landmark_description TEXT,
-    location_method VARCHAR(50) DEFAULT 'manual_pin',
     location_group_id UUID NOT NULL,
     is_latest BOOLEAN NOT NULL DEFAULT TRUE,
     possible_duplicate BOOLEAN NOT NULL DEFAULT FALSE,

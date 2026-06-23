@@ -11,6 +11,10 @@ const db = require('./db');
 const reportsRouter = require('./routes/reports');
 const authRouter = require('./routes/auth');
 const emergencyAlertsRouter = require('./routes/emergencyAlerts');
+const webhookRouter = require('./routes/webhook');
+const leaderboardRouter = require('./routes/leaderboard');
+const triageRouter = require('./routes/triage');
+const { swaggerUi, specs } = require('./swagger');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -41,6 +45,12 @@ app.get('/api/health', (req, res) => {
 app.use('/api/reports', reportsRouter);
 app.use('/api/auth', authRouter);
 app.use('/api/emergency-alerts', emergencyAlertsRouter);
+app.use('/api/leaderboard', leaderboardRouter);
+app.use('/api/triage', triageRouter);
+app.use('/webhook', webhookRouter);
+
+// Swagger API Documentation
+app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(specs));
 
 // Start server and initialize database
 app.listen(PORT, async () => {
